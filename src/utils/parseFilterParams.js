@@ -1,4 +1,4 @@
-import { typeList } from "../constants/contacts.js";
+import { typeList } from "../constants/index.js";
 
 const parseContactType = (contactType) => {
     if(typeof contactType !== "string") return undefined;
