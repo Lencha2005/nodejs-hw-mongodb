@@ -1,9 +1,16 @@
 import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
+import handlebars from 'handlebars';
+import path from 'node:path';
+import fs from 'node:fs/promises';
 import {randomBytes} from 'crypto';
-import createHttpError from "http-errors";
-import { UsersCollection } from "../db/models/user.js"
+import createHttpError from 'http-errors';
+
+import { UsersCollection } from '../db/models/user.js'
 import { SessionCollection } from '../db/models/session.js';
-import { FIFTEEN_MIN, THIRTY_DAYS } from '../constants/index.js';
+import { FIFTEEN_MIN, TEMPLATES_DIR, THIRTY_DAYS } from '../constants/index.js';
+import { getEnvVar } from '../utils/getEnvVar.js';
+import { sendEmail } from '../utils/sendEmail.js';
 
 const createSession = () => ({
     accessToken: randomBytes(30).toString("base64"),
@@ -12,23 +19,23 @@ const createSession = () => ({
     refreshTokenValidUntil: new Date (Date.now() + THIRTY_DAYS),
 })
 
-export const registerUser = async(payload) => {
-    const user = await UsersCollection.findOne({email: payload.email});
+export const registerUser = async(userData) => {
+    const user = await UsersCollection.findOne({email: userData.email});
     if(user) throw createHttpError(409, "Email in use");
 
-    const hashPassword = await bcrypt.hash(payload.password, 10)
+    const hashPassword = await bcrypt.hash(userData.password, 10)
 
 return await UsersCollection.create({
-    ...payload,
+    ...userData,
     password: hashPassword,
 });
 };
 
-export const loginUser = async (payload) => {
-    const user = await UsersCollection.findOne({email: payload.email});
+export const loginUser = async (userData) => {
+    const user = await UsersCollection.findOne({email: userData.email});
     if(!user) throw createHttpError(401, "User not found");
 
-    const passwordCompere = await bcrypt.compare(payload.password, user.password);
+    const passwordCompere = await bcrypt.compare(userData.password, user.password);
     if(!passwordCompere) throw createHttpError(401, "User not found");
 
     await SessionCollection.deleteOne({userId: user._id});
@@ -60,10 +67,80 @@ export const refreshSession = async ({refreshToken, sessionId}) => {
     return SessionCollection.create({
         userId: session.userId,
         ...newSession,
-    })
+    });
 
 };
 
 export const logoutUser = async (sessionId) => {
     await SessionCollection.deleteOne({_id: sessionId});
+};
+
+export const requestResetToken = async email => {
+    const user = await UsersCollection.findOne({email});
+
+    if (!user) {
+        throw createHttpError(404, "User not found");
+    }
+
+    const resetToken = jwt.sign(
+        {
+            sub:user._id,
+            email,
+        },
+        getEnvVar("JWT_SECRET"),
+        {
+            expiresIn: "5m",
+        },
+    );
+    const resetPasswordTemplatePath = path.join(
+        TEMPLATES_DIR,
+        'reset-password-email.html',
+      );
+    const templateSource = ((await fs.readFile(resetPasswordTemplatePath)).toString());
+    const template = handlebars.compile(templateSource);
+    const html = template({
+        name: user.name,
+        link: `${getEnvVar("APP_DOMAIN")}/reset-password?token=${resetToken}`,
+    })
+
+    try {await sendEmail({
+        from: getEnvVar("SMTP_FROM"),
+        to: email,
+        subject: "Reset your password",
+        html,
+    });
+} catch {
+    throw createHttpError(500, "Failed to send the email, please try again later.")
 }
+};
+
+export const resetPassword = async userData => {
+let entries;
+
+try{
+    entries = jwt. verify(userData.token, getEnvVar("JWT_SECRET"));
+} catch (err) {
+    if (err instanceof jwt.TokenExpiredError) {
+        throw createHttpError(401, "Token is expired or invalid.");
+      }
+    if (err instanceof Error) throw createHttpError(401, err.message);
+    throw err;
+};
+
+const user = await UsersCollection.findOne({
+    email: entries.email,
+    _id: entries.sub,
+  });
+
+  if (!user) {
+    throw createHttpError(404, 'User not found');
+  };
+
+  const encryptedPassword = await bcrypt.hash(userData.password, 10);
+
+  await UsersCollection.updateOne(
+    { _id: user._id },
+    { password: encryptedPassword },
+  );
+  await SessionCollection.deleteMany({ userId: user._id });
+};
